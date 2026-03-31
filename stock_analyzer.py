@@ -64,23 +64,73 @@ def fm(dataset: str, data_id: str = '', start: str = '', **kw) -> list:
 # ══════════════════════════════════════════════════════════════
 # 台指期夜盤（自動抓，不需手動輸入）
 # ══════════════════════════════════════════════════════════════
+def _is_night_session() -> bool:
+    """台灣時間 15:00~05:00 = 夜盤進行中"""
+    h = datetime.now().hour
+    return h >= 15 or h < 5
+
+
+def _fetch_realtime_futures() -> dict:
+    """
+    夜盤進行中時，從台期所官方 API 取即時台指期近月報價。
+    POST https://mis.taifex.com.tw/futures/api/getQuoteList
+    """
+    try:
+        url = 'https://mis.taifex.com.tw/futures/api/getQuoteList'
+        body = {'MarketType': '1', 'SymbolType': 'F', 'Sym': 'TX'}
+        r = requests.post(url, json=body, headers=FINMIND_H, timeout=8)
+        quotes = r.json()['RtData']['QuoteList']
+        # 取近月：有成交量、排除現貨列（TXF-P）、取量最大
+        active = [q for q in quotes
+                  if q.get('CLastPrice') and q['SymbolID'] != 'TXF-P'
+                  and q.get('CTotalVolume')]
+        if not active:
+            return {}
+        q = max(active, key=lambda x: int(x['CTotalVolume']))
+        last    = float(q['CLastPrice'])
+        ref     = float(q['CRefPrice'])
+        spread  = round(last - ref)
+        sper    = round((last - ref) / ref * 100, 2)
+        return {
+            'date':       datetime.now().strftime('%Y-%m-%d'),
+            'close':      last,
+            'spread':     spread,
+            'spread_per': sper,
+            'open':       float(q['COpenPrice'] or last),
+            'high':       float(q['CHighPrice'] or last),
+            'low':        float(q['CLowPrice']  or last),
+            'volume':     int(q['CTotalVolume']),
+            'source':     '台期所即時',
+        }
+    except Exception:
+        return {}
+
+
 def fetch_tw_night_futures() -> dict:
     """
-    自動取得最近一個交易日的台指期盤後（after_market）近月收盤
+    自動取得台指期夜盤資料：
+    - 夜盤進行中（15:00~05:00）→ 優先抓 Yahoo Finance 即時價
+    - 夜盤結束後 → 從 FinMind 取已完成的夜盤收盤
     回傳 {'date','close','spread','spread_per','open','high','low','volume','source'}
     """
+    if _is_night_session():
+        result = _fetch_realtime_futures()
+        if result:
+            return result
+        # 即時抓失敗時提示，再 fall back FinMind 的前一完成夜盤
+        print('  ⚠️ 即時夜盤抓取失敗，改用 FinMind 前次夜盤（非即時）')
+
     rows = fm('TaiwanFuturesDaily', 'TX', days_ago(7))
-    # 只取近月（6碼 contract_date）且 after_market 且有成交量
     night = [d for d in rows
              if d['trading_session'] == 'after_market'
              and len(str(d['contract_date'])) == 6
              and d['volume'] > 0]
     if not night:
         return {}
-    # 先取最近日期，再取該日成交量最大的合約（排除遠月低流動性）
     latest_date = max(d['date'] for d in night)
     same_day    = [d for d in night if d['date'] == latest_date]
     latest      = max(same_day, key=lambda x: x['volume'])
+    src = 'FinMind(前夜盤)' if _is_night_session() else 'FinMind'
     return {
         'date':       latest['date'],
         'close':      latest['close'],
@@ -90,7 +140,7 @@ def fetch_tw_night_futures() -> dict:
         'high':       latest['max'],
         'low':        latest['min'],
         'volume':     latest['volume'],
-        'source':     'FinMind',
+        'source':     src,
     }
 
 
@@ -138,9 +188,10 @@ def fetch_global_market() -> float:
         except Exception:
             pass
 
-    # ── 台指期夜盤（FinMind 自動抓）──
-    print('\n── 台指期夜盤（FinMind）')
+    # ── 台指期夜盤（自動抓）──
     night = fetch_tw_night_futures()
+    src_label = night.get('source', 'FinMind') if night else 'FinMind'
+    print(f'\n── 台指期夜盤（{src_label}）')
     gap_pct = 0.0
     if night:
         s = night['spread']
@@ -316,6 +367,27 @@ def calc_technical(code: str) -> dict | None:
         bb_std   = float(c.rolling(20).std().iloc[-1])
         bb_pos   = (close - (bb_mid - 2*bb_std)) / (4*bb_std) * 100
 
+        # ── 日K型態 ──
+        o_today = float(df['Open'].iloc[-1])
+        h_today = float(h.iloc[-1])
+        l_today = float(l.iloc[-1])
+        day_range = h_today - l_today
+        if day_range > 0:
+            close_pos    = round((close   - l_today) / day_range * 100, 1)  # 0=收在最低 100=收在最高
+            upper_shadow = round((h_today - close)   / day_range * 100, 1)  # 上影線佔比
+            lower_shadow = round((close   - l_today) / day_range * 100, 1)  # 下影線佔比（同 close_pos）
+        else:
+            close_pos = upper_shadow = lower_shadow = 50.0
+        prev_close   = float(c.iloc[-2])
+        up_pct_today = (close - prev_close) / prev_close * 100
+        is_limit_up  = up_pct_today >= 9.5  # 漲停（台股漲幅上限約 10%）
+
+        if   close_pos >= 80:                      k_pattern = '強勢收盤'
+        elif close_pos <= 20:                      k_pattern = '弱勢收盤'
+        elif upper_shadow >= 60 and not is_limit_up: k_pattern = '長上影線'
+        elif lower_shadow >= 60:                   k_pattern = '長下影線'
+        else:                                      k_pattern = '中性'
+
         return {
             'code': code, 'close': round(close,2),
             'ma5':round(float(ma5),2), 'ma10':round(float(ma10),2), 'ma20':round(float(ma20),2),
@@ -328,6 +400,8 @@ def calc_technical(code: str) -> dict | None:
             'support':round(float(l.tail(20).min()),2), 'resist':round(float(h.tail(20).max()),2),
             'bb_pos':round(bb_pos,1),
             'ma_bull':bool(close > float(ma5) > float(ma10) > float(ma20)),
+            'close_pos':close_pos, 'upper_shadow':upper_shadow,
+            'is_limit_up':is_limit_up, 'k_pattern':k_pattern,
         }
     except Exception as e:
         print(f'  [{code}] 技術面失敗: {e}')
@@ -390,6 +464,24 @@ def score_stock(t, inst, marg, dt_pct, rev) -> tuple[int, list]:
             elif yoy>=0:   score+=1; notes.append(f'營收YoY+{yoy:.0f}%+1')
             else:                    notes.append(f'⚠️營收YoY{yoy:.0f}%')
         if mom and mom>=10: score+=2; notes.append(f'營收MoM+{mom:.0f}%+2')
+
+    # 日K型態（最高 +3，最低 -3）
+    cp  = t.get('close_pos', 50.0)
+    ush = t.get('upper_shadow', 50.0)
+    lim = t.get('is_limit_up', False)
+    if lim:
+        # 漲停：用量比區分是否真正鎖板
+        vr = t.get('vol_ratio', 0)
+        if vr >= 5:
+            notes.append(f'⚠️漲停大量({vr:.1f}x)，恐曾開板，隔日慎追')
+        else:
+            score += 1; notes.append(f'漲停({vr:.1f}x)+1')
+    else:
+        if   cp >= 80: score+=2; notes.append(f'強勢收盤({cp:.0f}%)+2')
+        elif cp >= 60: score+=1; notes.append(f'收盤偏強({cp:.0f}%)+1')
+        elif cp <= 20: score-=2; notes.append(f'⚠️弱勢收盤({cp:.0f}%)−2')
+        elif cp <= 40: score-=1; notes.append(f'⚠️收盤偏弱({cp:.0f}%)−1')
+        if ush >= 60:  score-=1; notes.append(f'⚠️長上影線({ush:.0f}%)−1')
 
     return score, notes
 
@@ -503,6 +595,9 @@ def main():
         rows.append({
             '代碼':r['code'], '收盤':r['close'], 'RSI':r['RSI'], 'K':r['K'],
             '量比':r['vol_ratio'],
+            'K線型態':r.get('k_pattern','-'),
+            '收盤位置':f'{r.get("close_pos","-"):.0f}%' if isinstance(r.get('close_pos'), float) else '-',
+            '上影%':f'{r.get("upper_shadow","-"):.0f}%' if isinstance(r.get('upper_shadow'), float) else '-',
             '外資(張)':f'{inst["foreign"]//1000:+,}' if inst else '-',
             '投信(張)':f'{inst["trust"]//1000:+,}'   if inst else '-',
             '融資增減':f'{marg["margin_chg"]//1000:+,}' if marg else '-',
