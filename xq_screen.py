@@ -19,6 +19,9 @@ import numpy as np
 import requests
 from datetime import datetime, timedelta
 from collections import defaultdict
+from dotenv import load_dotenv
+
+load_dotenv()
 
 warnings.filterwarnings("ignore")
 
@@ -27,8 +30,9 @@ if sys.platform == "win32":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 # ── 設定 ────────────────────────────────────────────────────────
-TRADING_DAYS   = 65        # 歷史天數（MA60 需要 ≥ 60）
-MIN_VOL_張     = 300       # 最低成交量門檻
+HIST_DAYS      = 100       # 歷史天數（MA60 需要 ≥ 60，多抓保險）
+MIN_VOL_張     = 300       # 最低成交量門檻（TWSE/TPEX 快照用）
+FM_MIN_VOL_張  = 1000      # FinMind 請求門檻（節省配額）
 MIN_PRICE      = 10        # 最低股價
 
 FINMIND_TOKEN  = os.getenv("FINMIND_TOKEN", "")
@@ -55,6 +59,100 @@ def _to_float(s: str) -> float | None:
         return float(s) if s not in ("--", "", "X", "除權", "除息", "除權息") else None
     except ValueError:
         return None
+
+
+def _parse_tpex_openapi(rows: list, result: dict) -> int:
+    """解析 TPEX OpenAPI 格式，寫入 result，回傳新增支數"""
+    count = 0
+    for row in rows:
+        code = str(row.get("SecuritiesCompanyCode", "")).strip()
+        if not (code.isdigit() and len(code) == 4):
+            continue
+        c = _to_float(row.get("Close", ""))
+        if c is None or c < MIN_PRICE:
+            continue
+        vol = int(str(row.get("TradingShares", "0")).replace(",", "") or 0) // 1000
+        chg = _to_float(row.get("Change", "0")) or 0.0
+        result[code] = {
+            "name":    str(row.get("CompanyName", "")).strip(),
+            "close":   c,
+            "vol_張":  vol,
+            "chg_pct": round(chg / (c - chg) * 100, 2) if (c - chg) else 0,
+            "market":  "TWO",
+        }
+        count += 1
+    return count
+
+
+def _parse_tpex_hist(tables: list, result: dict) -> int:
+    """解析 TPEX 歷史網頁格式（tables[0]['data']），寫入 result，回傳新增支數"""
+    count = 0
+    try:
+        data = tables[0].get("data", [])
+    except (IndexError, AttributeError):
+        return 0
+    for row in data:
+        # 欄位: [代碼, 名稱, 收盤, 漲跌, 開盤, 最高, 最低, 均價, 成交量(千股), ...]
+        try:
+            code = str(row[0]).strip()
+            if not (code.isdigit() and len(code) == 4):
+                continue
+            c = _to_float(row[2])
+            if c is None or c < MIN_PRICE:
+                continue
+            vol = int(str(row[8]).replace(",", "") or 0)  # 單位已是張
+            chg = _to_float(row[3]) or 0.0
+            result[code] = {
+                "name":    str(row[1]).strip(),
+                "close":   c,
+                "vol_張":  vol,
+                "chg_pct": round(chg / (c - chg) * 100, 2) if (c - chg) else 0,
+                "market":  "TWO",
+            }
+            count += 1
+        except Exception:
+            continue
+    return count
+
+
+def _fetch_tpex(result: dict) -> int:
+    """
+    嘗試順序：
+    1. TPEX OpenAPI（當日）
+    2. 若空值（放假/盤前），往回找最近 5 個交易日的歷史 URL
+    """
+    # 1. 今日 OpenAPI
+    try:
+        r = SESSION.get(TPEX_TODAY_URL, timeout=15)
+        rows = r.json()
+        if rows:
+            return _parse_tpex_openapi(rows, result)
+    except Exception:
+        pass
+
+    # 2. Fallback：逐日往回找歷史資料
+    for days_back in range(1, 6):
+        dt = datetime.today() - timedelta(days=days_back)
+        if dt.weekday() >= 5:          # 跳過週六日
+            continue
+        roc_date = f"{dt.year - 1911}/{dt.month:02d}/{dt.day:02d}"
+        url = (
+            f"{TPEX_HIST_URL}?l=zh-tw&d={roc_date}&se=AL&response=json"
+        )
+        try:
+            r = SESSION.get(url, timeout=15)
+            data = r.json()
+            tables = data.get("tables", [])
+            if tables:
+                count = _parse_tpex_hist(tables, result)
+                if count > 0:
+                    print(f"  TPEX 今日無資料（放假），改用 {roc_date} 歷史資料")
+                    return count
+        except Exception:
+            continue
+
+    print("  TPEX 無法取得資料（今日+近5日皆失敗）")
+    return 0
 
 
 def fetch_valid_codes() -> dict[str, dict]:
@@ -88,83 +186,59 @@ def fetch_valid_codes() -> dict[str, dict]:
     except Exception as e:
         print(f"  TWSE 失敗：{e}")
 
-    # ── TPEX 上櫃 ──
-    tpex_count = 0
-    try:
-        r = SESSION.get(TPEX_TODAY_URL, timeout=15)
-        for row in r.json():
-            code = str(row.get("SecuritiesCompanyCode", "")).strip()
-            if not (code.isdigit() and len(code) == 4):
-                continue
-            c = _to_float(row.get("Close", ""))
-            if c is None or c < MIN_PRICE:
-                continue
-            vol = int(str(row.get("TradingShares", "0")).replace(",", "") or 0) // 1000
-            chg = _to_float(row.get("Change", "0")) or 0.0
-            result[code] = {
-                "name":    str(row.get("CompanyName", "")).strip(),
-                "close":   c,
-                "vol_張":  vol,
-                "chg_pct": round(chg / (c - chg) * 100, 2) if (c - chg) else 0,
-                "market":  "TWO",
-            }
-            tpex_count += 1
-        print(f"  TPEX 上櫃：{tpex_count} 支")
-    except Exception as e:
-        print(f"  TPEX 失敗（可能今日無資料）：{e}")
+    # ── TPEX 上櫃（先試今日 OpenAPI，放假則 fallback 到歷史 URL）──
+    tpex_count = _fetch_tpex(result)
+    print(f"  TPEX 上櫃：{tpex_count} 支")
 
     return result
 
 
 # ════════════════════════════════════════════════════════════════
-# 2. yfinance 抓歷史（對已驗證代碼，無 ghost ticker）
+# 2. FinMind 抓日K歷史（官方資料，無 ghost ticker）
 # ════════════════════════════════════════════════════════════════
-
-def fetch_yf_history(code: str, market: str, period: str = "6mo") -> pd.DataFrame | None:
-    """對已知合法代碼抓 yfinance 歷史，不會有 ghost ticker"""
-    import yfinance as yf
-    ticker = f"{code}.{market}"
-    try:
-        df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
-        if df.empty or len(df) < 5:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel(1)
-        # 統一小寫欄名，重置 index 產生 "date" 欄
-        df.columns = [c.lower() for c in df.columns]
-        df = df.reset_index()
-        df = df.rename(columns={"Date": "date", "index": "date", "datetime": "date"})
-        return df
-    except Exception:
-        return None
-
 
 def build_history(valid_codes: dict, n_workers: int = 8) -> dict[str, pd.DataFrame]:
     """
-    對 TWSE/TPEX 驗證過的代碼，用 yfinance 批次抓歷史。
-    因代碼來自官方，完全不會有 ghost ticker。
+    用 FinMind TaiwanStockPrice 抓日K歷史。
+    資料來自官方，無 ghost ticker 問題，上市+上櫃都有。
     """
-    import yfinance as yf
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from tqdm import tqdm
 
-    # 初篩：量 > 300張（減少 yfinance 呼叫次數）
+    start_date = (datetime.today() - timedelta(days=HIST_DAYS)).strftime("%Y-%m-%d")
+
+    # 初篩：量 > 1000張（節省 FinMind 每小時 600 次配額）
     candidates = {
         code: info for code, info in valid_codes.items()
-        if info["vol_張"] >= MIN_VOL_張
+        if info["vol_張"] >= FM_MIN_VOL_張
     }
-    print(f"  初篩後候選：{len(candidates)} 支（量>{MIN_VOL_張}張）")
+    print(f"  初篩後候選：{len(candidates)} 支（量>{FM_MIN_VOL_張}張）")
 
     result = {}
     items = list(candidates.items())
 
     def _fetch(item):
         code, info = item
-        df = fetch_yf_history(code, info["market"])
-        if df is None:
+        try:
+            r = SESSION.get(FINMIND_URL, params={
+                "dataset":    "TaiwanStockPrice",
+                "data_id":    code,
+                "start_date": start_date,
+                "token":      FINMIND_TOKEN,
+            }, timeout=15)
+            data = r.json().get("data", [])
+            if not data or len(data) < 5:
+                return None
+            df = pd.DataFrame(data)
+            # FinMind 欄名對應: max→high, min→low, Trading_Volume→volume（單位：股，÷1000=張）
+            df = df.rename(columns={"max": "high", "min": "low", "Trading_Volume": "volume"})
+            for col in ("open", "close", "high", "low", "volume"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.sort_values("date").reset_index(drop=True)
+            df["name"] = info["name"]
+            return code, df
+        except Exception:
             return None
-        df["name"] = info["name"]
-        return code, df
 
     with ThreadPoolExecutor(max_workers=n_workers) as ex:
         futures = {ex.submit(_fetch, item): item for item in items}
@@ -260,6 +334,7 @@ def calc_indicators(code: str, df: pd.DataFrame) -> dict | None:
             "chg_pct":          round(chg_pct, 2),
             "vol_張":           int(v.iloc[-1] / 1000),
             "vol_ratio":        round(vol_ratio, 2),
+            "vol_ma5_張":       round(float(vol_ma5.iloc[-1] / 1000), 0),
             "vol_ma20_張":      round(float(vol_ma20.iloc[-1] / 1000), 0),
             "ma5":              round(float(ma5.iloc[-1]), 2),
             "ma10":             round(float(ma10.iloc[-1]), 2),
@@ -308,7 +383,7 @@ def screen_turtle(s: dict) -> bool:
     return (
         _base_ok(s)
         and s["close"] > s["high20_prev"]
-        and s["vol_ma20_張"] > 1000
+        and s["vol_ma5_張"] > 1000
     )
 
 
@@ -347,7 +422,7 @@ def screen_kd_golden(s: dict) -> bool:
     return (
         _base_ok(s)
         and s["K_prev"] < s["D_prev"]
-        and s["K_prev"] < 40
+        and s["K_prev"] < 30
         and s["K"] > s["D"]
         and s["rsi"] < 70
     )
@@ -497,13 +572,13 @@ def write_md(df_cross: pd.DataFrame, strategy_lists: dict, today: str, inst: dic
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-inst", action="store_true", help="跳過法人資料")
-    parser.add_argument("--days",    type=int, default=TRADING_DAYS, help="歷史天數（預設65）")
+    parser.add_argument("--days",    type=int, default=HIST_DAYS, help="歷史天數（預設100）")
     args = parser.parse_args()
 
     today = datetime.today().strftime("%Y-%m-%d")
     print(f"\n{'='*60}")
     print(f"  台股策略選股  xq_screen.py v2  {today}")
-    print(f"  資料來源：TWSE + TPEX OpenAPI（官方，免費）")
+    print(f"  資料來源：TWSE + TPEX OpenAPI + FinMind（官方，無 ghost ticker）")
     print(f"{'='*60}\n")
 
     # 1. 取得官方股票清單（無 ghost ticker）
@@ -511,8 +586,8 @@ def main():
     valid_codes = fetch_valid_codes()
     print(f"  上市+上櫃合計：{len(valid_codes)} 支\n")
 
-    # 2. 下載歷史資料（只對官方代碼，無 ghost ticker）
-    print("下載歷史資料（yfinance，官方代碼）...")
+    # 2. 下載歷史資料（FinMind，官方台股日K，無 ghost ticker）
+    print("下載歷史資料（FinMind TaiwanStockPrice）...")
     history = build_history(valid_codes)
 
     # 2. 計算技術指標
@@ -522,17 +597,7 @@ def main():
         s = calc_indicators(code, df)
         if s:
             tech_data.append(s)
-    # 去重：若多支股票的收盤/漲幅/RSI/K 完全相同 → ghost ticker，只保留代碼最小那支
-    seen_fp: dict[tuple, str] = {}
-    deduped = []
-    for s in tech_data:
-        fp = (s["close"], s["chg_pct"], round(s["rsi"], 1), round(s["K"], 1))
-        if fp not in seen_fp:
-            seen_fp[fp] = s["code"]
-            deduped.append(s)
-    ghost_removed = len(tech_data) - len(deduped)
-    tech_data = deduped
-    print(f"  有效：{len(tech_data)} 支（移除 ghost {ghost_removed} 支）\n")
+    print(f"  有效：{len(tech_data)} 支\n")
 
     # 3. 策略篩選
     print("執行策略篩選...")
