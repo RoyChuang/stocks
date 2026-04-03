@@ -35,7 +35,13 @@ MIN_VOL_張     = 300       # 最低成交量門檻（TWSE/TPEX 快照用）
 FM_MIN_VOL_張  = 1000      # FinMind 請求門檻（節省配額）
 MIN_PRICE      = 10        # 最低股價
 
-FINMIND_TOKEN  = os.getenv("FINMIND_TOKEN", "")
+# 支援多組 token 輪流，配額加倍
+_FM_TOKENS = [t for t in [
+    os.getenv("FINMIND_TOKEN_1", ""),
+    os.getenv("FINMIND_TOKEN_2", ""),
+    os.getenv("FINMIND_TOKEN",   ""),   # 相容舊版單一 token
+] if t]
+FINMIND_TOKEN  = _FM_TOKENS[0] if _FM_TOKENS else ""
 FINMIND_URL    = "https://api.finmindtrade.com/api/v4/data"
 
 TWSE_TODAY_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
@@ -218,13 +224,14 @@ def build_history(valid_codes: dict, n_workers: int = 8) -> dict[str, pd.DataFra
     items = list(candidates.items())
 
     def _fetch(item):
-        code, info = item
+        idx, (code, info) = item
+        token = _FM_TOKENS[idx % len(_FM_TOKENS)] if _FM_TOKENS else FINMIND_TOKEN
         try:
             r = SESSION.get(FINMIND_URL, params={
                 "dataset":    "TaiwanStockPrice",
                 "data_id":    code,
                 "start_date": start_date,
-                "token":      FINMIND_TOKEN,
+                "token":      token,
             }, timeout=15)
             data = r.json().get("data", [])
             if not data or len(data) < 5:
@@ -241,7 +248,7 @@ def build_history(valid_codes: dict, n_workers: int = 8) -> dict[str, pd.DataFra
             return None
 
     with ThreadPoolExecutor(max_workers=n_workers) as ex:
-        futures = {ex.submit(_fetch, item): item for item in items}
+        futures = {ex.submit(_fetch, item): item for item in enumerate(items)}
         for f in tqdm(as_completed(futures), total=len(futures), ncols=70):
             r = f.result()
             if r:
@@ -480,13 +487,14 @@ def fetch_institutional(codes: list[str]) -> dict:
         return {}
     start = (datetime.today() - timedelta(days=14)).strftime("%Y-%m-%d")
     result = {}
-    for code in codes:
+    for i, code in enumerate(codes):
+        token = _FM_TOKENS[i % len(_FM_TOKENS)] if _FM_TOKENS else FINMIND_TOKEN
         try:
             r = requests.get(FINMIND_URL, params={
                 "dataset":    "TaiwanStockInstitutionalInvestorsBuySell",
                 "data_id":    code,
                 "start_date": start,
-                "token":      FINMIND_TOKEN,
+                "token":      token,
             }, timeout=10)
             df = pd.DataFrame(r.json().get("data", []))
             if df.empty:
