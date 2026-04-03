@@ -149,12 +149,26 @@ def fetch_and_calc(ticker_info: tuple) -> dict | None:
         upper_shad = (float(h.iloc[-1]) - float(c.iloc[-1])) / day_range * 100
         chg_pct    = (float(c.iloc[-1]) / float(c.iloc[-2]) - 1) * 100
 
-        # ── 20日最高（取前一日，避免今日自比） ──
+        # ── 20日最高 H（不含今日，海龜用） ──
         high20_prev = float(h.rolling(20).max().iloc[-2])
+
+        # ── 起漲點：均線糾結度 ──
+        ma_max = ma5.combine(ma20, max).combine(ma60, max)
+        ma_min = ma5.combine(ma20, min).combine(ma60, min)
+        tangle_pct = float((ma_max.iloc[-1] - ma_min.iloc[-1]) / (ma_min.iloc[-1] + 1e-9) * 100)
+        ma5_rising = float(ma5.iloc[-1]) > float(ma5.iloc[-2])
+
+        # ── 明日強勢股：上影線 vs 實體 ──
+        body = abs(float(c.iloc[-1]) - float(o.iloc[-1])) or 0.01
+        upper_shadow_abs = float(h.iloc[-1]) - float(c.iloc[-1])
+
+        # 用近20日收盤序列計算 hash，供去重使用
+        series_hash = hash(tuple(round(float(x), 2) for x in c.iloc[-20:]))
 
         return {
             "code":        code,
             "name":        CODE_NAME.get(code, ""),
+            "series_hash": series_hash,
             "close":       round(float(c.iloc[-1]), 2),
             "close_prev":  round(float(c.iloc[-2]), 2),
             "chg_pct":     round(chg_pct, 2),
@@ -186,6 +200,13 @@ def fetch_and_calc(ticker_info: tuple) -> dict | None:
             "macd_w_bull": macd_w_bull,
             # 突破
             "high20_prev": round(high20_prev, 2),
+            # 起漲點額外指標
+            "tangle_pct":  round(tangle_pct, 2),   # 均線糾結度%
+            "ma5_rising":  ma5_rising,               # MA5向上
+            "ma_max":      round(float(ma_max.iloc[-1]), 2),
+            # 明日強勢股額外
+            "body":             round(body, 2),
+            "upper_shadow_abs": round(upper_shadow_abs, 2),
             # K線型態
             "close_pos":   round(close_pos, 1),
             "upper_shad":  round(upper_shad, 1),
@@ -205,36 +226,51 @@ def _base_ok(s: dict) -> bool:
 
 
 def screen_turtle(s: dict) -> bool:
-    """🐢 海龜突破：收盤突破前20日高點 + 量比≥1.5x + 非漲停"""
+    """🐢 海龜突破（XQ邏輯）：收盤突破前20日最高H（不含今日）+ 5日均量>1000張"""
     return (
         _base_ok(s)
-        and s["close"] > s["high20_prev"]
-        and s["vol_ratio"] >= 1.5
-        and not s["is_limit_up"]
-        and s["chg_pct"] > 0
+        and s["close"] > s["high20_prev"]   # Close > Highest(High[1], 20)
+        and s["vol_ma20_張"] > 1000          # Average(Volume,5) > VolFilter
     )
 
 
 def screen_breakout(s: dict) -> bool:
-    """🚀 起漲點：由下往上突破MA20（前日收盤在MA20以下）+ 量比≥2x"""
-    return (
-        _base_ok(s)
-        and s["close"] > s["ma20"]
-        and s["close_prev"] <= s["ma20_prev"]
-        and s["vol_ratio"] >= 2.0
-        and s["rsi"] < 75
+    """🚀 起漲點（XQ邏輯）：均線糾結突破 OR 箱型突破，均需量比≥1.5x
+
+    策略A：均線糾結(<2%) + 今日突破所有均線 + MA5向上
+    策略B：收盤突破前20日H（箱型高點）
+    共同：Volume > 5日均量 * 1.5
+    """
+    vol_ok = s["vol_ratio"] >= 1.5  # Volume > Average(Volume,5) * 1.5
+
+    # 策略A：均線糾結突破
+    cond_a = (
+        s["tangle_pct"] < 2.0           # 三均線差距<2%（糾結）
+        and s["close"] > s["ma_max"]     # 今日突破所有均線
+        and s["ma5_rising"]              # MA5向上
     )
+
+    # 策略B：箱型突破（收盤突破前20日最高H）
+    cond_b = s["close"] > s["high20_prev"]
+
+    return _base_ok(s) and vol_ok and (cond_a or cond_b)
 
 
 def screen_strong_close(s: dict) -> bool:
-    """💪 強勢收盤（明日強勢股近似）：收盤位置≥80% + 量比≥1.5x + 上影線短 + 非漲停"""
+    """💪 明日強勢股（XQ邏輯）：
+    condition1: 漲幅 > 3%
+    condition2: 量比 >= 1.5x
+    condition3: 收盤 > 前20日最高H（創近期新高）
+    condition4: 收盤 > MA60（在季線之上）
+    condition5: 上影線 < 實體 * 0.5（收盤強勢，留影不長）
+    """
     return (
         _base_ok(s)
-        and s["close_pos"] >= 80
-        and s["vol_ratio"] >= 1.5
-        and s["upper_shad"] <= 25
-        and not s["is_limit_up"]
-        and s["chg_pct"] > 0
+        and s["chg_pct"] > 3.0                              # condition1
+        and s["vol_ratio"] >= 1.5                           # condition2
+        and s["close"] > s["high20_prev"]                   # condition3
+        and s["close"] > s["ma60"]                          # condition4
+        and s["upper_shadow_abs"] < s["body"] * 0.5         # condition5
     )
 
 
@@ -448,15 +484,21 @@ def main():
                 tech_data.append(r)
     print(f"   有效資料：{len(tech_data)} 檔  ({time.time()-t0:.0f}秒)")
 
-    # 去重：yfinance 對無效 ticker 有時回傳相鄰代碼資料，
-    # 造成多支股票數值完全相同。用 (close, chg_pct, rsi, K) 指紋去重，保留首筆。
+    # 去重：yfinance 對無效 ticker 有時回傳相鄰代碼資料（ghost ticker），
+    # 造成多支股票擁有完全相同的20日價格序列。
+    # 策略：計算每個 hash 出現次數，只有出現 ≥3 次的才是明顯的 ghost cluster，
+    # 保留第一筆，移除後續。出現 1~2 次視為正常（兩支股票歷史相似的極端情況）。
+    from collections import Counter
+    hash_count = Counter(s["series_hash"] for s in tech_data)
     seen_fp: set = set()
     dedup_data = []
     for s in tech_data:
-        fp = (s["close"], s["chg_pct"], s["rsi"], s["K"])
-        if fp not in seen_fp:
+        fp = s["series_hash"]
+        if hash_count[fp] < 3:
+            dedup_data.append(s)        # 出現1~2次：無條件保留
+        elif fp not in seen_fp:
             seen_fp.add(fp)
-            dedup_data.append(s)
+            dedup_data.append(s)        # 出現≥3次：只保留第一筆
     removed = len(tech_data) - len(dedup_data)
     if removed:
         print(f"   去重後：{len(dedup_data)} 檔（移除 {removed} 筆重複）")
