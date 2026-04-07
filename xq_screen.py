@@ -39,6 +39,7 @@ MIN_PRICE      = 10        # 最低股價
 _FM_TOKENS = [t for t in [
     os.getenv("FINMIND_TOKEN_1", ""),
     os.getenv("FINMIND_TOKEN_2", ""),
+    os.getenv("FINMIND_TOKEN_3", ""),
     os.getenv("FINMIND_TOKEN",   ""),   # 相容舊版單一 token
 ] if t]
 FINMIND_TOKEN  = _FM_TOKENS[0] if _FM_TOKENS else ""
