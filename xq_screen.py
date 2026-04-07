@@ -479,6 +479,38 @@ STRATEGIES = {
 
 
 # ════════════════════════════════════════════════════════════════
+# 隔日沖策略（獨立區塊，不計入主策略重疊數）
+# ════════════════════════════════════════════════════════════════
+
+def daytrade_chase(s: dict) -> bool:
+    """🚦 追板型：漲停 + 收盤位置100% + 量比≥1.5 + K<85"""
+    return (
+        _base_ok(s)
+        and s["is_limit_up"]
+        and s["close_pos"] >= 99
+        and s["vol_ratio"] >= 1.5
+        and s["K"] < 85
+    )
+
+
+def daytrade_strong(s: dict) -> bool:
+    """💨 強勢收盤型：漲幅5~9.4% + 收盤位置≥80% + 量比≥2 + RSI<80"""
+    return (
+        _base_ok(s)
+        and 5.0 <= s["chg_pct"] < 9.5
+        and s["close_pos"] >= 80
+        and s["vol_ratio"] >= 2.0
+        and s["rsi"] < 80
+    )
+
+
+DAYTRADE_STRATEGIES = {
+    "🚦追板型":     daytrade_chase,
+    "💨強勢收盤型": daytrade_strong,
+}
+
+
+# ════════════════════════════════════════════════════════════════
 # 4. FinMind 法人資料
 # ════════════════════════════════════════════════════════════════
 
@@ -523,7 +555,7 @@ def fetch_institutional(codes: list[str]) -> dict:
 # 5. MD 報告輸出
 # ════════════════════════════════════════════════════════════════
 
-def write_md(df_cross: pd.DataFrame, strategy_lists: dict, today: str, inst: dict):
+def write_md(df_cross: pd.DataFrame, strategy_lists: dict, today: str, inst: dict, daytrade: dict | None = None):
     os.makedirs("daily", exist_ok=True)
     lines = [
         f"# {today} 策略選股報告\n",
@@ -563,6 +595,30 @@ def write_md(df_cross: pd.DataFrame, strategy_lists: dict, today: str, inst: dic
                 f"{s['rsi']} | {s['K']} | {s['vol_ratio']}x | {inet} |"
             )
         lines.append("")
+
+    # ── 隔日沖區塊 ──
+    if daytrade:
+        lines += ["---\n", "## 🎯 隔日沖候選（明日短線）\n",
+                  "> 開盤前確認大盤期指方向，跌逾 -1% 全部跳過。\n"]
+        for dtype, lst in daytrade.items():
+            if not lst:
+                continue
+            top8 = sorted(lst, key=lambda x: x["vol_ratio"], reverse=True)[:8]
+            hint = "開盤+2%內追，破昨收出" if "追板" in dtype else "開平~小高進，破昨收出"
+            lines += [
+                f"### {dtype}（{len(lst)} 支）— {hint}\n",
+                "| 代碼 | 名稱 | 收盤 | 漲幅% | 量比 | K | RSI | 收盤位置% | 策略數 |",
+                "|------|------|------|-------|------|---|-----|---------|-------|",
+            ]
+            for s in top8:
+                # 取對應的策略數（從 df_cross）
+                strat_n = df_cross.loc[df_cross["代碼"] == s["code"], "策略數"].values
+                n = int(strat_n[0]) if len(strat_n) else 0
+                lines.append(
+                    f"| {s['code']} | {s['name']} | {s['close']} | {s['chg_pct']}% | "
+                    f"{s['vol_ratio']}x | {s['K']} | {s['rsi']} | {s['close_pos']}% | {'⭐'*n if n else '-'} |"
+                )
+            lines.append("")
 
     lines += [
         "---\n",
@@ -658,8 +714,18 @@ def main():
     elif not FINMIND_TOKEN and not args.no_inst:
         print("⚠ 未設定 FINMIND_TOKEN，跳過法人（set FINMIND_TOKEN=xxx）\n")
 
-    # 6. 輸出 MD
-    write_md(df_cross, strategy_lists, today, inst)
+    # 6. 隔日沖篩選
+    print("篩選隔日沖候選...")
+    daytrade = {name: [] for name in DAYTRADE_STRATEGIES}
+    for s in tech_data:
+        for name, fn in DAYTRADE_STRATEGIES.items():
+            if fn(s):
+                daytrade[name].append(s)
+    for name, lst in daytrade.items():
+        print(f"    {name}: {len(lst)} 支")
+
+    # 7. 輸出 MD
+    write_md(df_cross, strategy_lists, today, inst, daytrade)
 
     # 7. 終端摘要
     print(f"\n{'='*60}")
