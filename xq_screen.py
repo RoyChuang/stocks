@@ -32,7 +32,7 @@ if sys.platform == "win32":
 # ── 設定 ────────────────────────────────────────────────────────
 HIST_DAYS      = 100       # 歷史天數（MA60 需要 ≥ 60，多抓保險）
 MIN_VOL_張     = 300       # 最低成交量門檻（TWSE/TPEX 快照用）
-FM_MIN_VOL_張  = 1000      # FinMind 請求門檻（節省配額）
+FM_MIN_VOL_張  = 1500      # FinMind 請求門檻（節省配額，1500張≈每token ~425次，留法人空間）
 MIN_PRICE      = 10        # 最低股價
 
 # 支援多組 token 輪流，配額加倍
@@ -718,8 +718,8 @@ def main():
     # 5. 法人資料（所有命中股，上限 100 支，雙 token 約用 100 配額）
     inst = {}
     if not args.no_inst and _FM_TOKENS:
-        cands = list(hit_map.keys())[:100]
-        print(f"抓法人籌碼（{len(cands)} 支，含自營商）...")
+        cands = list(hit_map.keys())[:30]
+        print(f"抓法人籌碼（{len(cands)} 支，Top30，含自營商）...")
         inst = fetch_institutional(cands)
         sell_warn = [c for c, v in inst.items() if v.get("出貨警示")]
         print(f"  完成 {len(inst)} 支  ⚠️ 出貨警示：{len(sell_warn)} 支 {sell_warn[:5]}\n")
