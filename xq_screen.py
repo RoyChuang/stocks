@@ -533,17 +533,21 @@ def fetch_institutional(codes: list[str]) -> dict:
                 continue
             df["net"] = df["buy"].astype(float) - df["sell"].astype(float)
             row = {}
-            for name, key in [("外資及陸資", "外資"), ("投信", "投信")]:
+            for name, key in [("外資及陸資", "外資"), ("投信", "投信"), ("自營商", "自營")]:
                 sub = df[df["name"] == name].sort_values("date")
-                row[f"{key}3日"]  = int(sub["net"].tail(3).sum() / 1000) if not sub.empty else 0
+                row[f"{key}3日"] = int(sub["net"].tail(3).sum() / 1000) if not sub.empty else 0
                 if key == "外資" and not sub.empty:
                     consec = 0
                     for n in reversed(sub["net"].tolist()):
-                        if n > 0:
-                            consec += 1
-                        else:
-                            break
+                        if n > 0: consec += 1
+                        else: break
                     row["連買日"] = consec
+            # 籌碼綜合判斷
+            f3 = row.get("外資3日", 0)
+            t3 = row.get("投信3日", 0)
+            d3 = row.get("自營3日", 0)
+            row["法人合計3日"] = f3 + t3 + d3
+            row["出貨警示"] = f3 < -500 or (f3 < 0 and t3 < 0)  # 外資大賣 or 外資投信同賣
             result[code] = row
             time.sleep(0.25)
         except Exception:
@@ -563,18 +567,22 @@ def write_md(df_cross: pd.DataFrame, strategy_lists: dict, today: str, inst: dic
         f"命中：{len(df_cross)} 支  重疊≥2：{len(df_cross[df_cross['策略數']>=2])} 支\n",
         "---\n",
         f"## ⭐ 多策略重疊候選（≥2 策略）\n",
-        "| 代碼 | 名稱 | 收盤 | 漲幅% | RSI | K | 量比 | 收盤位置% | 策略 | 外資3日 | 連買 |",
-        "|------|------|------|-------|-----|---|------|---------|------|---------|------|",
+        "| 代碼 | 名稱 | 收盤 | 漲幅% | RSI | K | 量比 | 策略 | 外資3日 | 投信3日 | 自營3日 | 連買 |",
+        "|------|------|------|-------|-----|---|------|------|---------|---------|---------|------|",
     ]
     top = df_cross[df_cross["策略數"] >= 2].head(25)
     for _, r in top.iterrows():
         code = r["代碼"]
-        inet = f"{inst.get(code,{}).get('外資3日','-')}張" if code in inst else "-"
-        icon = f"{inst.get(code,{}).get('連買日','-')}日" if code in inst else "-"
+        iv   = inst.get(code, {})
+        warn = "⚠️" if iv.get("出貨警示") else ""
+        f3   = f"{iv.get('外資3日','-')}張" if code in inst else "-"
+        t3   = f"{iv.get('投信3日','-')}張" if code in inst else "-"
+        d3   = f"{iv.get('自營3日','-')}張" if code in inst else "-"
+        cl   = f"{iv.get('連買日','-')}日"  if code in inst else "-"
         stars = "⭐" * int(r["策略數"])
         lines.append(
-            f"| {code} | {r['名稱']} | {r['收盤']} | {r['漲幅%']}% | {r['RSI']} | {r['K']} | "
-            f"{r['量比']}x | {r['收盤位置%']}% | {stars} {r['策略']} | {inet} | {icon} |"
+            f"| {warn}{code} | {r['名稱']} | {r['收盤']} | {r['漲幅%']}% | {r['RSI']} | {r['K']} | "
+            f"{r['量比']}x | {stars} {r['策略']} | {f3} | {t3} | {d3} | {cl} |"
         )
     lines += ["\n---\n"]
 
@@ -584,15 +592,18 @@ def write_md(df_cross: pd.DataFrame, strategy_lists: dict, today: str, inst: dic
         top10 = sorted(lst, key=lambda x: x["vol_ratio"], reverse=True)[:10]
         lines += [
             f"## {name}（{len(lst)} 支，依量比 Top10）\n",
-            "| 代碼 | 名稱 | 收盤 | 漲幅% | RSI | K | 量比 | 外資3日 |",
-            "|------|------|------|-------|-----|---|------|---------|",
+            "| 代碼 | 名稱 | 收盤 | 漲幅% | RSI | K | 量比 | 外資3日 | 投信3日 |",
+            "|------|------|------|-------|-----|---|------|---------|---------|",
         ]
         for s in top10:
-            c = s["code"]
-            inet = f"{inst.get(c,{}).get('外資3日','-')}張" if c in inst else "-"
+            c    = s["code"]
+            iv   = inst.get(c, {})
+            warn = "⚠️" if iv.get("出貨警示") else ""
+            f3   = f"{iv.get('外資3日','-')}張" if c in inst else "-"
+            t3   = f"{iv.get('投信3日','-')}張" if c in inst else "-"
             lines.append(
-                f"| {c} | {s['name']} | {s['close']} | {s['chg_pct']}% | "
-                f"{s['rsi']} | {s['K']} | {s['vol_ratio']}x | {inet} |"
+                f"| {warn}{c} | {s['name']} | {s['close']} | {s['chg_pct']}% | "
+                f"{s['rsi']} | {s['K']} | {s['vol_ratio']}x | {f3} | {t3} |"
             )
         lines.append("")
 
@@ -704,15 +715,16 @@ def main():
     print(f"\n  重疊≥2：{len(df_cross[df_cross['策略數']>=2])} 支")
     print(f"  result_screen.csv 寫入完成\n")
 
-    # 5. 法人資料
+    # 5. 法人資料（所有命中股，上限 100 支，雙 token 約用 100 配額）
     inst = {}
-    if not args.no_inst and FINMIND_TOKEN:
-        cands = df_cross[df_cross["策略數"] >= 2]["代碼"].tolist()[:60]
-        print(f"抓法人資料（{len(cands)} 支）...")
+    if not args.no_inst and _FM_TOKENS:
+        cands = list(hit_map.keys())[:100]
+        print(f"抓法人籌碼（{len(cands)} 支，含自營商）...")
         inst = fetch_institutional(cands)
-        print(f"  完成 {len(inst)} 支\n")
-    elif not FINMIND_TOKEN and not args.no_inst:
-        print("⚠ 未設定 FINMIND_TOKEN，跳過法人（set FINMIND_TOKEN=xxx）\n")
+        sell_warn = [c for c, v in inst.items() if v.get("出貨警示")]
+        print(f"  完成 {len(inst)} 支  ⚠️ 出貨警示：{len(sell_warn)} 支 {sell_warn[:5]}\n")
+    elif not _FM_TOKENS and not args.no_inst:
+        print("⚠ 未設定 FINMIND_TOKEN，跳過法人\n")
 
     # 6. 隔日沖篩選
     print("篩選隔日沖候選...")
