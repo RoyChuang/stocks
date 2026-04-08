@@ -32,7 +32,7 @@ if sys.platform == "win32":
 # ── 設定 ────────────────────────────────────────────────────────
 HIST_DAYS      = 100       # 歷史天數（MA60 需要 ≥ 60，多抓保險）
 MIN_VOL_張     = 300       # 最低成交量門檻（TWSE/TPEX 快照用）
-FM_MIN_VOL_張  = 1500      # FinMind 請求門檻（節省配額，1500張≈每token ~425次，留法人空間）
+FM_MIN_VOL_張  = 1000      # FinMind 請求門檻（對齊 XQ 海龜濾網 1000張）
 MIN_PRICE      = 10        # 最低股價
 
 # 支援多組 token 輪流，配額加倍
@@ -484,24 +484,26 @@ STRATEGIES = {
 # ════════════════════════════════════════════════════════════════
 
 def daytrade_chase(s: dict) -> bool:
-    """🚦 追板型：漲停 + 收盤位置100% + 量比≥1.5 + K<85"""
+    """🚦 追板型：漲停 + 收盤位置100% + 量比≥1.5 + K<85 + 量≥5000張"""
     return (
         _base_ok(s)
         and s["is_limit_up"]
         and s["close_pos"] >= 99
         and s["vol_ratio"] >= 1.5
         and s["K"] < 85
+        and s["vol_張"] >= 5000
     )
 
 
 def daytrade_strong(s: dict) -> bool:
-    """💨 強勢收盤型：漲幅5~9.4% + 收盤位置≥80% + 量比≥2 + RSI<80"""
+    """💨 強勢收盤型：漲幅5~9.4% + 收盤位置≥80% + 量比≥2 + RSI<80 + 量≥5000張"""
     return (
         _base_ok(s)
         and 5.0 <= s["chg_pct"] < 9.5
         and s["close_pos"] >= 80
         and s["vol_ratio"] >= 2.0
         and s["rsi"] < 80
+        and s["vol_張"] >= 5000
     )
 
 
